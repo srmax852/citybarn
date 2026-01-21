@@ -198,10 +198,71 @@ class ShopifyImportController extends Controller
                 }
             }
 
+            // Build a set of all product identifiers from the API (barcodes and titles)
+            $apiProductBarcodes = [];
+            $apiProductTitles = [];
+
+            foreach ($products as $product) {
+                $productList = (is_array($product) && isset($product[0]) && is_array($product[0]))
+                    ? $product
+                    : [$product];
+
+                foreach ($productList as $item) {
+                    if (!is_array($item)) continue;
+
+                    $title = $item['Description'] ?? null;
+                    $barcode = trim($item['Barcode'] ?? '');
+
+                    if (!empty($barcode)) {
+                        $apiProductBarcodes[$barcode] = true;
+                    }
+                    if (!empty($title)) {
+                        $apiProductTitles[strtolower(trim($title))] = true;
+                    }
+                }
+            }
+
+            // Delete products from Shopify that are not in the API response
+            $productsDeleted = 0;
+            Log::info("Checking for orphaned products to delete...");
+
+            // Re-fetch fresh Shopify products to get accurate list
+            $shopifyProducts = $this->shopify->getAllShopifyProducts();
+
+            foreach ($shopifyProducts['byBarcode'] as $barcode => $productId) {
+                // If barcode exists in Shopify but not in API, delete it
+                if (!isset($apiProductBarcodes[$barcode])) {
+                    // Double-check: also check if title exists in API
+                    $titleKey = array_search($productId, $shopifyProducts['byTitle']);
+                    if ($titleKey === false || !isset($apiProductTitles[$titleKey])) {
+                        if ($this->shopify->deleteProduct($productId)) {
+                            $productsDeleted++;
+                            Log::info("Deleted orphaned product: {$productId} (barcode: {$barcode})");
+                        }
+                    }
+                }
+            }
+
+            // Also check products that only have title (no barcode)
+            foreach ($shopifyProducts['byTitle'] as $title => $productId) {
+                // Skip if already deleted via barcode check
+                if (in_array($productId, array_values($shopifyProducts['byBarcode']))) {
+                    continue;
+                }
+
+                // If title exists in Shopify but not in API, delete it
+                if (!isset($apiProductTitles[$title])) {
+                    if ($this->shopify->deleteProduct($productId)) {
+                        $productsDeleted++;
+                        Log::info("Deleted orphaned product: {$productId} (title: {$title})");
+                    }
+                }
+            }
+
             Log::info("Shopify import completed.", [
                 'departments' => ['created' => $departmentsCreated, 'skipped' => $departmentsSkipped],
                 'sub_departments' => ['created' => $subDepartmentsCreated, 'skipped' => $subDepartmentsSkipped],
-                'products' => ['created' => $productsCreated, 'skipped' => $productsSkipped],
+                'products' => ['created' => $productsCreated, 'skipped' => $productsSkipped, 'deleted' => $productsDeleted],
             ]);
 
             // Record sync time
@@ -222,6 +283,7 @@ class ShopifyImportController extends Controller
                 'products' => [
                     'created' => $productsCreated,
                     'skipped' => $productsSkipped,
+                    'deleted' => $productsDeleted,
                     'total' => $productsCreated + $productsSkipped
                 ],
             ]);

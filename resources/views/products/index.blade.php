@@ -196,7 +196,7 @@
                             <ul class="mt-2 text-sm space-y-1">
                                 <li>Departments: ${data.departments.created} created, ${data.departments.skipped} skipped</li>
                                 <li>Sub-Departments: ${data.sub_departments.created} created, ${data.sub_departments.skipped} skipped</li>
-                                <li>Products: ${data.products.created} created, ${data.products.skipped} skipped</li>
+                                <li>Products: ${data.products.created} created, ${data.products.skipped} skipped, ${data.products.deleted || 0} deleted</li>
                             </ul>
                             <p class="mt-2 text-sm text-emerald-600">Refreshing page...</p>
                         </div>

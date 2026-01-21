@@ -300,6 +300,26 @@ class ShopifyService
         return $res->json('product.id');
     }
 
+    /**
+     * Delete a product from Shopify
+     */
+    public function deleteProduct(int $productId): bool
+    {
+        try {
+            $res = $this->client()->delete("https://{$this->shopDomain}/admin/api/{$this->apiVersion}/products/{$productId}.json");
+        } catch (\Illuminate\Http\Client\ConnectionException $e) {
+            Log::error("❌ Connection failed to Shopify (deleteProduct)", ['error' => $e->getMessage()]);
+            return false;
+        }
+
+        if ($res->failed()) {
+            Log::error("❌ Failed to delete product {$productId}", ['response' => $res->body()]);
+            return false;
+        }
+
+        return true;
+    }
+
     /* 🔹 Product → Collection Mapping */
 
     /**
