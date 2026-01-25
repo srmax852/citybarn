@@ -129,14 +129,15 @@ class ShopifyService
 
     /**
      * Fetch all existing Shopify products and build lookup maps
-     * Returns ['byBarcode' => [...], 'byTitle' => [...]]
+     * Returns ['byBarcode' => [...], 'byTitle' => [...], 'products' => [...]]
      */
     public function getAllShopifyProducts(): array
     {
         $byBarcode = [];
         $byTitle = [];
+        $productsData = []; // Full product data for comparison
 
-        $url = "https://{$this->shopDomain}/admin/api/{$this->apiVersion}/products.json?limit=250&fields=id,title,variants";
+        $url = "https://{$this->shopDomain}/admin/api/{$this->apiVersion}/products.json?limit=250&fields=id,title,body_html,variants";
 
         do {
             try {
@@ -156,6 +157,18 @@ class ShopifyService
             foreach ($products as $product) {
                 $productId = $product['id'];
                 $title = strtolower(trim($product['title'] ?? ''));
+                $variant = $product['variants'][0] ?? [];
+
+                // Store full product data for comparison
+                $productsData[$productId] = [
+                    'id' => $productId,
+                    'title' => $product['title'] ?? '',
+                    'body_html' => $product['body_html'] ?? '',
+                    'price' => (float) ($variant['price'] ?? 0),
+                    'compare_at_price' => $variant['compare_at_price'] ? (float) $variant['compare_at_price'] : null,
+                    'barcode' => $variant['barcode'] ?? '',
+                    'variant_id' => $variant['id'] ?? null,
+                ];
 
                 // Index by title
                 if ($title) {
@@ -163,8 +176,8 @@ class ShopifyService
                 }
 
                 // Index by barcode from variants
-                foreach ($product['variants'] ?? [] as $variant) {
-                    $barcode = trim($variant['barcode'] ?? '');
+                foreach ($product['variants'] ?? [] as $v) {
+                    $barcode = trim($v['barcode'] ?? '');
                     if ($barcode) {
                         $byBarcode[$barcode] = $productId;
                     }
@@ -179,7 +192,7 @@ class ShopifyService
 
         Log::info("Fetched all Shopify products", ['byBarcode' => count($byBarcode), 'byTitle' => count($byTitle)]);
 
-        return ['byBarcode' => $byBarcode, 'byTitle' => $byTitle];
+        return ['byBarcode' => $byBarcode, 'byTitle' => $byTitle, 'products' => $productsData];
     }
 
     /**
@@ -298,6 +311,53 @@ class ShopifyService
         }
 
         return $res->json('product.id');
+    }
+
+    /**
+     * Update an existing product in Shopify
+     */
+    public function updateProduct(int $productId, string $title, float $price, string $barcode = '', ?float $compareAtPrice = null, string $bodyHtml = '', ?int $variantId = null): bool
+    {
+        $variant = [
+            'price' => $price,
+            'barcode' => $barcode,
+        ];
+
+        // Include variant ID if provided
+        if ($variantId) {
+            $variant['id'] = $variantId;
+        }
+
+        // Only add compare_at_price if it exists and is greater than price
+        if ($compareAtPrice !== null && $compareAtPrice > $price) {
+            $variant['compare_at_price'] = $compareAtPrice;
+        } else {
+            // Clear compare_at_price if no promo
+            $variant['compare_at_price'] = null;
+        }
+
+        $data = [
+            'product' => [
+                'id' => $productId,
+                'title' => $title,
+                'body_html' => $bodyHtml,
+                'variants' => [$variant]
+            ]
+        ];
+
+        try {
+            $res = $this->client()->put("https://{$this->shopDomain}/admin/api/{$this->apiVersion}/products/{$productId}.json", $data);
+        } catch (\Illuminate\Http\Client\ConnectionException $e) {
+            Log::error("❌ Connection failed to Shopify (updateProduct)", ['error' => $e->getMessage()]);
+            return false;
+        }
+
+        if ($res->failed()) {
+            Log::error("❌ Failed to update product {$productId}", ['response' => $res->body()]);
+            return false;
+        }
+
+        return true;
     }
 
     /**
