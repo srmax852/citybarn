@@ -99,19 +99,25 @@ class ShopifyImportController extends Controller
             }
 
             //Import Products
-            $productsCreated = $productsSkipped = 0;
+            $productsCreated = $productsSkipped = $productsUpdated = 0;
 
             // Pre-fetch all existing Shopify products for fast lookup
             Log::info("Fetching existing Shopify products for cache...");
             $existingProducts = $this->shopify->getAllShopifyProducts();
             $existingByBarcode = $existingProducts['byBarcode'];
             $existingByTitle = $existingProducts['byTitle'];
+            $shopifyProductsData = $existingProducts['products'] ?? [];
             Log::info("Product cache ready", ['barcodes' => count($existingByBarcode), 'titles' => count($existingByTitle)]);
 
             // Pre-fetch all existing product-collection mappings
             Log::info("Fetching existing product-collection mappings...");
             $collectsCache = $this->shopify->getAllCollects();
             Log::info("Collects cache ready", ['count' => count($collectsCache)]);
+
+            // Track API products for deletion check (build during main loop)
+            $apiProductBarcodes = [];
+            $apiProductTitles = [];
+            $processedProductIds = []; // Track which Shopify products we've seen
 
             foreach ($products as $index => $product) {
                 // Handle nested product arrays (some APIs return grouped data)
@@ -126,6 +132,16 @@ class ShopifyImportController extends Controller
                     $barcode = trim($item['Barcode'] ?? '');
                     $depId = $item['DepID'] ?? null;
                     $subId = $item['SubID'] ?? null;
+
+                    if (!$title) continue;
+
+                    $titleKey = strtolower(trim($title));
+
+                    // Track for deletion check
+                    if (!empty($barcode)) {
+                        $apiProductBarcodes[$barcode] = true;
+                    }
+                    $apiProductTitles[$titleKey] = true;
 
                     // Price logic:
                     // - If StorePromoPrice exists: use it as price, and StoreUnitPrice (or WebUnitPrice) as compare_at_price
@@ -145,11 +161,8 @@ class ShopifyImportController extends Controller
                         $price = (float) ($storeUnitPrice ?? $webUnitPrice);
                     }
 
-                    if (!$title) continue;
-
                     // Check if product exists using pre-fetched cache (no API calls!)
                     $existingProductId = null;
-                    $titleKey = strtolower(trim($title));
 
                     if (!empty($barcode) && isset($existingByBarcode[$barcode])) {
                         $existingProductId = $existingByBarcode[$barcode];
@@ -158,15 +171,54 @@ class ShopifyImportController extends Controller
                     }
 
                     if ($existingProductId) {
-                        // Product already exists, skip creation
-                        $productsSkipped++;
+                        // Product exists - check if it needs updating
                         $productId = $existingProductId;
+                        $processedProductIds[$existingProductId] = true;
+                        $existingData = $shopifyProductsData[$existingProductId] ?? null;
+
+                        if ($existingData) {
+                            // Compare all fields to see if update is needed
+                            $needsUpdate = false;
+
+                            // Title
+                            if ($existingData['title'] !== $title) {
+                                $needsUpdate = true;
+                            }
+                            // Price
+                            if (abs($existingData['price'] - $price) > 0.01) {
+                                $needsUpdate = true;
+                            }
+                            // Compare at price
+                            $existingCompare = $existingData['compare_at_price'] ?? 0;
+                            $newCompare = $compareAtPrice ?? 0;
+                            if (abs($existingCompare - $newCompare) > 0.01) {
+                                $needsUpdate = true;
+                            }
+                            // Body HTML / Description
+                            $bodyHtml = $item['WebDesc'] ?? '';
+                            if (!empty($bodyHtml) && ($existingData['body_html'] ?? '') !== $bodyHtml) {
+                                $needsUpdate = true;
+                            }
+
+                            if ($needsUpdate) {
+                                $variantId = $existingData['variant_id'] ?? null;
+                                if ($this->shopify->updateProduct($existingProductId, $title, $price, $barcode, $compareAtPrice, $bodyHtml, $variantId)) {
+                                    $productsUpdated++;
+                                    Log::info("Updated product: {$title}");
+                                }
+                            } else {
+                                $productsSkipped++;
+                            }
+                        } else {
+                            $productsSkipped++;
+                        }
                     } else {
                         // Create new product
                         $productId = $this->shopify->createProductOnly($title, $price, $barcode, $compareAtPrice);
 
                         if ($productId) {
                             $productsCreated++;
+                            $processedProductIds[$productId] = true;
                             // Add to cache for future iterations
                             if (!empty($barcode)) {
                                 $existingByBarcode[$barcode] = $productId;
@@ -193,50 +245,26 @@ class ShopifyImportController extends Controller
                 }
 
                 // Reduced sleep since we're making fewer API calls now
-                if ($index % 10 === 0) {
-                    usleep(100000);
-                }
-            }
-
-            // Build a set of all product identifiers from the API (barcodes and titles)
-            $apiProductBarcodes = [];
-            $apiProductTitles = [];
-
-            foreach ($products as $product) {
-                $productList = (is_array($product) && isset($product[0]) && is_array($product[0]))
-                    ? $product
-                    : [$product];
-
-                foreach ($productList as $item) {
-                    if (!is_array($item)) continue;
-
-                    $title = $item['Description'] ?? null;
-                    $barcode = trim($item['Barcode'] ?? '');
-
-                    if (!empty($barcode)) {
-                        $apiProductBarcodes[$barcode] = true;
-                    }
-                    if (!empty($title)) {
-                        $apiProductTitles[strtolower(trim($title))] = true;
-                    }
+                if ($index % 20 === 0) {
+                    usleep(50000);
                 }
             }
 
             // Delete products from Shopify that are not in the API response
+            // Use the already-fetched data instead of re-fetching
             $productsDeleted = 0;
             Log::info("Checking for orphaned products to delete...");
 
-            // Re-fetch fresh Shopify products to get accurate list
-            $shopifyProducts = $this->shopify->getAllShopifyProducts();
-
-            foreach ($shopifyProducts['byBarcode'] as $barcode => $productId) {
+            $deletedIds = [];
+            foreach ($existingByBarcode as $barcode => $productId) {
                 // If barcode exists in Shopify but not in API, delete it
-                if (!isset($apiProductBarcodes[$barcode])) {
+                if (!isset($apiProductBarcodes[$barcode]) && !isset($deletedIds[$productId])) {
                     // Double-check: also check if title exists in API
-                    $titleKey = array_search($productId, $shopifyProducts['byTitle']);
+                    $titleKey = array_search($productId, $existingByTitle);
                     if ($titleKey === false || !isset($apiProductTitles[$titleKey])) {
                         if ($this->shopify->deleteProduct($productId)) {
                             $productsDeleted++;
+                            $deletedIds[$productId] = true;
                             Log::info("Deleted orphaned product: {$productId} (barcode: {$barcode})");
                         }
                     }
@@ -244,9 +272,9 @@ class ShopifyImportController extends Controller
             }
 
             // Also check products that only have title (no barcode)
-            foreach ($shopifyProducts['byTitle'] as $title => $productId) {
-                // Skip if already deleted via barcode check
-                if (in_array($productId, array_values($shopifyProducts['byBarcode']))) {
+            foreach ($existingByTitle as $title => $productId) {
+                // Skip if already deleted
+                if (isset($deletedIds[$productId])) {
                     continue;
                 }
 
@@ -254,6 +282,7 @@ class ShopifyImportController extends Controller
                 if (!isset($apiProductTitles[$title])) {
                     if ($this->shopify->deleteProduct($productId)) {
                         $productsDeleted++;
+                        $deletedIds[$productId] = true;
                         Log::info("Deleted orphaned product: {$productId} (title: {$title})");
                     }
                 }
@@ -262,7 +291,7 @@ class ShopifyImportController extends Controller
             Log::info("Shopify import completed.", [
                 'departments' => ['created' => $departmentsCreated, 'skipped' => $departmentsSkipped],
                 'sub_departments' => ['created' => $subDepartmentsCreated, 'skipped' => $subDepartmentsSkipped],
-                'products' => ['created' => $productsCreated, 'skipped' => $productsSkipped, 'deleted' => $productsDeleted],
+                'products' => ['created' => $productsCreated, 'updated' => $productsUpdated, 'skipped' => $productsSkipped, 'deleted' => $productsDeleted],
             ]);
 
             // Record sync time
@@ -282,9 +311,10 @@ class ShopifyImportController extends Controller
                 ],
                 'products' => [
                     'created' => $productsCreated,
+                    'updated' => $productsUpdated,
                     'skipped' => $productsSkipped,
                     'deleted' => $productsDeleted,
-                    'total' => $productsCreated + $productsSkipped
+                    'total' => $productsCreated + $productsUpdated + $productsSkipped
                 ],
             ]);
 
